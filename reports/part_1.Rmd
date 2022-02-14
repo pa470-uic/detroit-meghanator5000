@@ -1,6 +1,6 @@
 ---
 title: "Part 1"
-author: "YOUR NAME"
+author: "Meghan Mokate"
 output: 
   html_document:
     code_folding: hide
@@ -12,29 +12,306 @@ output:
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
 library(tidyverse)
 library(lubridate)
-
+require(XLConnect)
+library(readxl)   
+#devtools::install_github("cmf-uchicago/cmfproperty")
+library(cmfproperty)
+library(gridExtra)
+library(tidymodels)
 ```
 
 Template file. Code will be included in folded blocks in the output to facilitate grading. Please knit this file and commit both the rmd and the html output. If you add external files to your analysis, please commit them to the files folder in this repository. NOTE: please do not commit large (15MB+) files to GitHub. Instead please denote the origin of the files in your code. 
 
 ```{r}
-#example connection to database. note that you have to download the database from onedrive
+con <- DBI::dbConnect(RSQLite::SQLite(), "../database/detroit.sqlite")
+```
 
-con <- DBI::dbConnect(RSQLite::SQLite(), "database/detroit.sqlite")
+I load in the sales and assessments datasets, since these contain the initial information that I care about to begin analysis for this project.
+I filter out grantee and grantor information since it seems to be too specific to look into for initial considerations. This makes my analysis more digestible.
+I make a note that I removed these datasets. If there were information available for grantee / grantor broader groupings (ie, individual versus government etc), then these variables might be more helpful. As is, they are not very meaningful.
 
-# sales tbl
+I remove the taxable value variable. This is because it is "the assessed value minus any exemptions" (https://www.crowdreason.com/blog/tax-assessment-vs-property-tax#:~:text=The%20assessed%20value%20does%20not,arrive%20at%20the%20tax%20liability).
 
-dplyr::tbl(con, 'sales')
+I do not care about exemptions at this point in time, I am more interested in what the property assessment is. Therefore, I remove the variable.
+```{r}
+sales <- dplyr::tbl(con, 'sales') %>% dplyr::collect() %>%
+  rename(propclass = property_c) %>%
+  mutate(sale_date = ymd(sale_date)) %>%
+  select(parcel_num, sale_date, sale_price, sale_terms, ecf, propclass) %>%
+  mutate(SALE_YEAR = str_sub(sale_date, 1, 4)) %>%
+  mutate(SALE_YEAR = as.numeric(SALE_YEAR))
 
-# convert to tibble
-#dplyr::tbl(con, 'sales') %>% dplyr::collect()
+assessments <- dplyr::tbl(con, 'assessments') %>% dplyr::collect() %>%
+  rename(parcel_num = PARCELNO) %>%
+  select(-TAXABLEVALUE) 
 
-# sql query
+sales_assess <- left_join(assessments, sales) 
+```
 
-dplyr::tbl(con, 'sales') %>% count(year(sale_date))
+I read in the OFFICE OF THE ASSESSORS_PROPERTY CLASSIFICATIONS file. 
+```{r}
+ read_excel_allsheets <- function(filename, tibble = FALSE) {
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+}
 
-#dplyr::tbl(con, 'sales') %>% count(year(sale_date)) %>% show_query()
+mysheets <- read_excel_allsheets("../files/OFFICE OF THE ASSESSORS_PROPERTY CLASSIFICATIONS -rev.xlsx")
+```
+
+```{r}
+prop_codes_now0 <- mysheets$`PROPERTY CLASS CODES (Current)` 
+prop_codes_now <- prop_codes_now0 %>%
+  rename(propclass = CODE)
+```
+
+# Section A:
+
+## Conduct an exploratory data analysis of homes in Detroit. 
+## Offer an overview of relevant trends in the data and data quality issues. 
+## Contextualize your analysis with key literature on properties in Detroit.
+
+I begin by combining the above described datasets. 
+I decide to do some simple data cleansing, and to filter to only look at valid arms length transactions.
+These kind of transaction "is when the buyer and seller each act in their own self-interest to try to get the best deal they can". (https://www.realtor.com/advice/buy/what-is-an-arms-length-transaction/#:~:text=In%20real%20estate%2C%20an%20arm's,the%20best%20deal%20they%20can.&text=To%20resolve%20this%20discrepancy%2C%20both,real%20estate%20transactions%20play%20out)
+
+This filter is also consitent with the UChicago decision in analyzing Detroit property taxes: "we restrict our analysis to sales classified as arm’s-length by the assessor". (https://harris.uchicago.edu/files/evalrespropertytaxasdetroit20162018.pdf)
+
+I choose to do this filter so that I can get an accurate idea of what true differences in values are, without the analysis of sales price being skewed by other sale terms.
+
+```{r}
+sales_assess_class <- left_join(sales_assess, prop_codes_now, by = "propclass") %>%
+  select(-c(CATEGORY)) %>%
+  mutate(DESCRIPTION = ifelse(DESCRIPTION == "RESIDENTIAL LAND BANK SALE",
+                              "RESIDENTIAL LAND BANK" , DESCRIPTION)) %>%
+  mutate(sale_terms = ifelse(sale_terms == "valid arms length", "VALID ARMS LENGTH", 
+                             ifelse(sale_terms == "Valid Arms Length", "VALID ARMS LENGTH", 
+                                    sale_terms))) %>%
+  filter(!is.na(sale_date)) %>%
+  filter(sale_terms == "VALID ARMS LENGTH") %>%
+  select(-sale_terms) %>%
+  mutate(val_diff = sale_price - ASSESSEDVALUE)
+```
+
+I perform some distribution analysis. Given the slightly skewed distribution and presence of outliers, I decide to use median as an indicator for values.
+```{r}
+glimpse(sales_assess_class)
+unique(sales_assess_class$propclass)
+unique(sales_assess_class$year) # data 2011 through 2020
+
+mean(sales_assess_class$ASSESSEDVALUE)
+median(sales_assess_class$ASSESSEDVALUE)
+max(sales_assess_class$ASSESSEDVALUE)
+min(sales_assess_class$ASSESSEDVALUE)
+
+mean(sales_assess_class$sale_price)
+median(sales_assess_class$sale_price)
+max(sales_assess_class$sale_price)
+min(sales_assess_class$sale_price)
+
+mean(sales_assess_class$val_diff)
+median(sales_assess_class$val_diff)
+max(sales_assess_class$val_diff)
+min(sales_assess_class$val_diff)
+
+assessments_count_a <- sales_assess_class %>%
+  group_by(ASSESSEDVALUE) %>%
+  summarise(value = n())
+# 716986 have an assessment value of 0
+
+ac <- sales_assess_class %>%
+  ggplot() +
+  geom_density(aes(x=ASSESSEDVALUE)) +
+  ggtitle("Distribution of Assessed Value") +
+  labs(x = "Assessed Value",
+       y = "Count")
+
+sales_count <- sales_assess_class %>%
+  group_by(sale_price) %>%
+  summarise(value = n())
+
+sc <- sales_assess_class %>%
+  ggplot() +
+  geom_density(aes(x=sale_price)) +
+  ggtitle("Distribution of Sale Price") +
+  labs(x = "Sale Price",
+       y = "Count")
+
+diff_count <- sales_assess_class %>%
+  group_by(val_diff) %>%
+  summarise(value = n())
+
+dc <- sales_assess_class %>%
+  ggplot() +
+  geom_density(aes(x=val_diff)) +
+  ggtitle("Distribution of Sales Price less Assessed Value") +
+  labs(x = "Sales Price less Assessed Value",
+       y = "Count")
+
+grid.arrange(ac, sc, dc, nrow=3)
+```
+I look at the difference in median Sale Price and Assessed Value over the years. 
+
+It is clear that 2020 saw a huge increase in the gap between these two values, with Sale Price being much higher than Assessed Value. A gap has always existed, with Sale Price  being higher than Assessed Value, but it has been increasing in size since 2015.
+```{r}
+SAC_yr <- sales_assess_class %>%
+  group_by(SALE_YEAR) %>%
+  summarise("Sale Price" = median(sale_price),
+            "Assessed Value" = median(ASSESSEDVALUE)) %>%
+  mutate(Year = as.character(SALE_YEAR)) %>%
+  pivot_longer(cols = 2:3,
+               names_to = "Metric",
+               values_to = "Median") 
+  
+
+SAC_yr %>%
+  ggplot(aes(y=Median, x = Year, color = Metric)) +
+  geom_point() +
+  geom_line(aes(group = Metric)) +
+  ggtitle("Assessed Value versus Sale Price Over Time")
 
 ```
+
+I investigate the difference of median Sale Price less Assessed Value in each year by property class to get an idea of discrepancies here. It is clear that not all descriptions have values for each year. Condo Parent is intensely throwing off the visuals as a clear outlier, so I limit the y axis to make sense of the other classes. The most apparent observation of this analysis is that the different classes do not conform to any clear trend as each other.
+```{r}
+SAC_yr_desc <- sales_assess_class %>%
+  group_by(SALE_YEAR, DESCRIPTION) %>%
+  summarise(`Median Difference` = median(val_diff)) %>%
+  mutate(Year = as.character(SALE_YEAR)) 
+
+SAC_yr_desc %>%
+  ggplot(aes(y=`Median Difference`, x = Year, color = DESCRIPTION)) +
+  geom_point() +
+  geom_line(aes(group = DESCRIPTION)) +
+  geom_hline(yintercept = median(sales_assess_class$val_diff)) +
+  ggtitle("Sale Price less Assessed Value Over Time by Property Class") 
+
+SAC_yr_desc %>%
+  ggplot(aes(y=`Median Difference`, x = Year, color = DESCRIPTION)) +
+  geom_point() +
+  geom_line(aes(group = DESCRIPTION)) +
+  geom_hline(yintercept = median(sales_assess_class$val_diff)) +
+  ggtitle("Sale Price less Assessed Value Over Time by Property Class") +
+  ylim(0,200000)
+```
+While the above graph helps to account for what property classes are making up the dollar amount difference, the below graph demonstrates proportional accuracy by taking the difference over the sale price for each property class. This shows that the seemingly smaller errors in residential classes are a partially a result of this class having smaller sales price amounts, rather than truly being more appropriately assessed. Again, the different classes do not conform to any clear trend as each other.
+```{r}
+SAC_yr_desc_prop <- sales_assess_class %>%
+  group_by(SALE_YEAR, DESCRIPTION) %>%
+  summarise(`Median Difference` = median(val_diff),
+            `Median Sale Price` = median(sale_price),
+            `Difference versus Sale Price` = `Median Difference` / `Median Sale Price`) %>%
+  mutate(Year = as.character(SALE_YEAR)) 
+
+SAC_yr_desc_prop %>%
+  ggplot(aes(y=`Difference versus Sale Price`, x = Year, color = DESCRIPTION)) +
+  geom_point() +
+  geom_line(aes(group = DESCRIPTION)) +
+  ggtitle("Proportional Difference of Sale Price and Assessed Value \n Over Time by Property Class")
+```
+
+
+## Data Quality Issues
+One of the biggest issues in data quality is the lack of understanding behind the meaning of the ecf values. I know that an ecf "adjusts the assessor’s
+use of the Assessors Manual to the local market". (https://www.michigan.gov/documents/treasury/Development_of_ECF_for_Public_Use_7-13_456527_7.pdf). However, the values provided in the dataset are difficult for me to make sense of, and I was unable to find a coding explanation of these values. If I had these values, I would guess that this would be very helpful in explaining discrepancies in sales price and assessment values. 
+
+There were some data quality issues that were easy to adjust for, such as cleaning data values / variable names to match one another. Some were more difficult, such as missing values. Another challenge that I faced was appropriately mapping property classes to descriptions. This is because these mappings have changed several times throughout the last decade. I considered conditionally mapping these by year, but this makes year to year comparisons of property classes challenging, so I just use current mappings (2022). 
+
+# Section B:
+Use cmfproperty to conduct a sales ratio study across the relevant time period. Note that cmfproperty is designed to produce Rmarkdown reports but use the documentation and insert relevant graphs/figures into your report. Look to make this reproducible since you’ll need these methods to analyze your assessment model later on. Detroit has many sales which are not arm’s length (sold at fair market value) so some sales should be excluded, but which ones?
+
+Observations:
+Arms length sales took off from 2012 to 2014, dipped a little in 2015 before shooting up again and then dropping dramtically in 2020
+The gaps between sales price and assessed value grow as the value percentiles increase. This is true across all years, and the differences are most significant in 2020
+The ratios between Assessed Value and Sale Price show the same trends across all groups. The 25th percentile consistently has the highest ratio, followed by the 50th percentile and the 75th percentile. These ratios have all been decreasing since 2016
+The relationship between assessed value and sales price is very shallow compared to a slope of 1
+Median sales ratio has been decreasing since 2015 and is at its lowest in 2020
+Past ratios are right skewed
+```{r}
+sales_assess_class_1 <- sales_assess_class %>%
+  mutate(SALE_YEAR = as.numeric(SALE_YEAR))
+
+ratios <-
+  cmfproperty::reformat_data(
+    data = sales_assess_class_1,
+    sale_col = "sale_price",
+    assessment_col = "ASSESSEDVALUE",
+    sale_year_col = "SALE_YEAR",
+  )
+head(as.data.frame(ratios))
+stats <- cmfproperty::calc_iaao_stats(ratios)
+head(stats)
+output <- diagnostic_plots(stats,
+                           ratios,
+                           min_reporting_yr = 2011,
+                           max_reporting_yr = 2020)
+
+output[[1]]  
+output[[2]] 
+output[[3]] 
+output[[4]] 
+output[[5]] 
+output[[6]] 
+output[[7]]
+output[[8]]
+output[[9]]
+```
+
+# Section C: Explore trends and relationships with property sales using simple regressions
+
+The variables used to predict sales price are property class and sale year. 
+There are significant p values across the board. 
+The property classes seem to sway the estimated value significantly, with all of them having large increases except for property class 402 (smaller increase) and property class 461 (decrease). Years are less significant in their estimate impact, but years prior to 2018 decrease the estimate whereas years 2018 - 2020 increase it.
+```{r}
+sales_arms_length <- sales %>%
+  mutate(sale_terms = ifelse(sale_terms == "valid arms length", "VALID ARMS LENGTH", 
+                             ifelse(sale_terms == "Valid Arms Length", "VALID ARMS LENGTH", 
+                                    sale_terms))) %>%
+  filter(sale_terms == "VALID ARMS LENGTH") %>%
+  mutate(propclass = as.character(propclass),
+         SALE_YEAR = as.character(SALE_YEAR))
+
+lm_sales <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression") %>%
+  fit(sale_price ~ propclass + SALE_YEAR,
+      data = sales_arms_length)
+
+lm_sales %>% tidy() %>%
+  filter(!is.na(p.value))
+```
+
+# Section D: Explore trends and relationships with foreclosures using simple regressions
+
+The different years have varying impacts on the log odds ratio of a foreclosure occurring. All years prior to 2016 increase the log odds of foreclosure and all years 2016 and on decrease the log odds of foreclosure.
+
+```{r}
+foreclosures <- dplyr::tbl(con, 'foreclosures') %>% dplyr::collect() %>%
+  rename(parcel_num = prop_parcelnum)
+
+foreclosures_1 <- foreclosures %>%
+  pivot_longer(cols = 3:20,
+               names_to = "Year", 
+               values_to = "Foreclosures") %>%
+  filter(Year > 2010) %>%
+  mutate(Year = as.character(Year)) %>%
+  mutate(Foreclosures = ifelse(is.na(Foreclosures), 0, Foreclosures)) %>%
+  mutate(Foreclosures = as.factor(Foreclosures)) 
+  
+
+unique(foreclosures_1$Foreclosures)
+
+foreclosure_glm <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification") %>%
+  fit(Foreclosures ~ Year,
+      data = foreclosures_1)
+
+foreclosure_glm %>% tidy()
+
+```
+
 
 
